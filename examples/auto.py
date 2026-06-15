@@ -1,11 +1,14 @@
 import argparse
+import hashlib
+import pathlib
 
 import zcu
+from zcu.known_keys import KNOWN_KEYS, KNOWN_SIGNATURES, mac_to_str
+from zcu.xcryptors import CBCXcryptor, Xcryptor
 
-from zcu.known_keys import KNOWN_KEYS, KNOWN_SIGNATURES
-from zcu.xcryptors import Xcryptor, CBCXcryptor
-from zcu.known_keys import mac_to_str
-
+KNOWN_KEY_SUFFIXES = [
+    "Wj%2$CjM",  # F680
+]
 
 KNOWN_KEYPAIR_SUFFIXES = [
     ("", ""),  # e.g. type 3
@@ -27,6 +30,10 @@ KNOWN_KEYPAIRS = [
     ("H267AV1_CZkey", "H267AV1_CZIV"),
     ("8cc72b05705d5c46f412af8cbed55aad", "667b02a85c61c786def4521b060265e8"),
     ("8dc79b15726d5c46d412af8cbed65aad", "678b02a85c63c786def4523b061265e8"),
+    #  ZTE F670
+    ("L04&Product@5A238dc79b15726d5c06", "ZTE%FN$GponNJ025678b02a85c63c706"),
+    #  ZTE F6600P Payload 5
+    ("f680v9.0", "ZTE%FN$GponNJ025"),
 ]
 
 KNOWN_PASSWORD_KEYPAIR_SUFFIXES = [
@@ -37,6 +44,11 @@ KNOWN_PASSWORD_KEYPAIR_SUFFIXES = [
 KNOWN_MAC_SERIAL_IVS = [
     "ZTE%FN$GponNJ025",
 ]
+
+
+def md5_to_hex(x):
+    md5 = hashlib.md5(x.encode("utf8")).hexdigest()
+    return bytes(bytearray.fromhex(md5)).hex()[:16]
 
 
 def hardcoded_keypairs(args):
@@ -94,6 +106,25 @@ def serial_keypairs(args):
     return keypairs
 
 
+def mac_keypairs(args):
+    keypairs = []
+
+    if args.mac_address is None:
+        print("To decode any 'mac' payloads, please specify MAC Address, e.g.")
+        print("  --mac 'AA:BB:CC:DD:EE:FF'")
+        return keypairs
+
+    mac = args.mac_address
+
+    for suffix in KNOWN_KEY_SUFFIXES:
+        # AES key: 'three lowest bytes of MAC address' + 'Wj%2$CjM'
+        keypairs += [
+            (md5_to_hex(mac_to_str(mac, separator="")[6:] + suffix), None),
+        ]
+
+    return keypairs
+
+
 def mac_serial_keypairs(args):
     keypairs = []
     if args.mac_address is None or args.serial_number is None:
@@ -118,11 +149,18 @@ def mac_serial_keypairs(args):
             (serial[4:] + mac_to_str(mac, reverse=True, separator=""), iv),
             (serial[4:] + mac_to_str(mac, reverse=False, separator=":"), iv),
             (serial[4:] + mac_to_str(mac, reverse=True, separator=":"), iv),
-            # take last 8 chars, e.g. ZTEGXXXXXXXX
+            # take last 8 chars, e.g. ____XXXXXXXX
             (serial[-8:] + mac_to_str(mac, reverse=False, separator=""), iv),
             (serial[-8:] + mac_to_str(mac, reverse=True, separator=""), iv),
             (serial[-8:] + mac_to_str(mac, reverse=False, separator=":"), iv),
             (serial[-8:] + mac_to_str(mac, reverse=True, separator=":"), iv),
+            # take first 8 chars, e.g. ZTEGXXXX___
+            (serial[:8] + mac_to_str(mac, reverse=False, separator=""), iv),
+            (serial[:8] + mac_to_str(mac, reverse=True, separator=""), iv),
+            (serial[:8] + mac_to_str(mac, reverse=False, separator=":"), iv),
+            (serial[:8] + mac_to_str(mac, reverse=True, separator=":"), iv),
+            # seen in f680 router
+            (md5_to_hex(serial + mac_to_str(mac, reverse=True, separator="")), None),
         ]
 
         # # convert first 8 hex chars to ascii
@@ -186,7 +224,11 @@ def decrypt(infile, decryptor, keypair):
 
 
 HANDLERS = [
+    # key only
     lambda a: (hardcoded_keypairs(a), Xcryptor()),
+    lambda a: (mac_keypairs(a), Xcryptor()),
+    lambda a: (mac_serial_keypairs(a), Xcryptor()),
+    # key + iv
     lambda a: (signature_keypairs(a), CBCXcryptor()),  # requires signature
     lambda a: (serial_keypairs(a), CBCXcryptor()),  # requires serial
     lambda a: (mac_serial_keypairs(a), CBCXcryptor()),  # requires mac, serial
@@ -202,19 +244,20 @@ def main():
 
     parser.add_argument(
         "infile",
-        type=argparse.FileType("rb"),
+        type=pathlib.Path,
         help="Encoded configuration file e.g. config.bin",
     )
     parser.add_argument(
-        "outfile", type=argparse.FileType("wb"), help="Output file e.g. config.xml"
+        "outfile",
+        type=pathlib.Path,
+        nargs="?",
+        help="Output file e.g. config.xml",
     )
-
     parser.add_argument(
         "--little-endian",
         action="store_true",
         help="Whether payload is little-endian (defaults to big-endian)",
     )
-
     parser.add_argument(
         "--key",
         type=str,
@@ -269,7 +312,22 @@ def main():
 
     args = parser.parse_args()
 
-    infile = args.infile
+    infile_path: pathlib.Path = args.infile
+    outfile_path: pathlib.Path = args.outfile
+    if outfile_path is None:
+        outfile_path = infile_path.with_suffix(".xml")
+
+        if outfile_path.exists():
+            overwrite = input(f"Output file {outfile_path} exists, overwrite? (y/N) ").lower()
+            while overwrite not in {"y", "n", ""}:
+                overwrite = input(f"Output file {outfile_path} exists, overwrite? (y/N) ").lower()
+
+            if overwrite != "y":
+                print("Not overwriting output, nothing to do!")
+                return
+
+    infile = open(infile_path, "rb")
+    outfile = open(outfile_path, "wb")
 
     # check magic
     header = infile.read(4)
@@ -302,12 +360,12 @@ def main():
             return 1
     else:
         decompressed, _ = zcu.compression.decompress(infile)
-        args.outfile.write(decompressed.read())
+        outfile.write(decompressed.read())
         print(f"Successfully decompressed {infile.name}")
         return 0
 
     decompressed, _ = zcu.compression.decompress(decrypted)
-    args.outfile.write(decompressed.read())
+    outfile.write(decompressed.read())
     print(
         f"Successfully decrypted and decompressed {infile.name} using (key, iv): {keypair}"
     )

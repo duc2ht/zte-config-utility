@@ -1,12 +1,12 @@
 """Encode config.xml into config.bin"""
 
 import argparse
+import pathlib
 from types import SimpleNamespace
 
 import zcu
-
-from zcu.xcryptors import Xcryptor, CBCXcryptor
 from zcu.known_keys import run_any_keygen
+from zcu.xcryptors import CBCXcryptor, Xcryptor
 
 
 def main():
@@ -17,11 +17,11 @@ def main():
     )
     parser.add_argument(
         "infile",
-        type=argparse.FileType("rb"),
+        type=pathlib.Path,
         help="Raw configuration file e.g. config.xml",
     )
     parser.add_argument(
-        "outfile", type=argparse.FileType("wb"), help="Output file, e.g. config.bin"
+        "outfile", type=pathlib.Path, nargs="?", help="Output file, e.g. config.bin"
     )
     parser.add_argument(
         "--key", type=lambda x: x.encode(), default=b"", help="Key for AES encryption"
@@ -45,6 +45,18 @@ def main():
         help="Generate Key/IV from serial number(DIGImobil routers), implies payload-type 4",
     )
     parser.add_argument(
+        "--mac",
+        type=str,
+        default="",
+        help="MAC address for TagParams-based key generation, implies payload-type 4",
+    )
+    parser.add_argument(
+        "--longpass",
+        type=str,
+        default="",
+        help="Long password from TagParams (entry 4100) for key generation, implies payload-type 4",
+    )
+    parser.add_argument(
         "--signature",
         type=str,
         default="",
@@ -61,8 +73,8 @@ def main():
     parser.add_argument(
         "--payload-type",
         type=int,
-        default=0,
-        choices=[0, 2, 3, 4],
+        default=None,
+        choices=[0, 2, 3, 4, 5, 6],
         help="Payload type (0=plain, 2=aes128ecb key encryption, 3=aes256cbc model encryption, 4=aes256cbc signature/serial encryption)",
     )
     parser.add_argument(
@@ -109,19 +121,64 @@ def main():
         default="",
         help="Override IV suffix for Signature based key generation",
     )
+    parser.add_argument(
+        "--force-no-key",
+        action="store_true",
+        help="Don't try to infer AES key from signature",
+    )
+    parser.add_argument(
+        "--incorrect-compressed-size",
+        action="store_true",
+        help="Whether the 'compressed size' header incorrectly includes the final chunk size twice",
+    )
 
     args = parser.parse_args()
 
-    infile = args.infile
-    outfile = args.outfile
+    infile_path: pathlib.Path = args.infile
+    outfile_path: pathlib.Path = args.outfile
+    if outfile_path is None:
+        outfile_path = infile_path.with_suffix(".bin")
+
+        if outfile_path.exists():
+            overwrite = input(f"Output file {outfile_path} exists, overwrite? (y/N) ").lower()
+            while overwrite not in {"y", "n", ""}:
+                overwrite = input(f"Output file {outfile_path} exists, overwrite? (y/N) ").lower()
+
+            if overwrite != "y":
+                print("Not overwriting output, nothing to do!")
+                return
+
+    infile = open(infile_path, "rb")
+    outfile = open(outfile_path, "wb")
+
     key = args.key
     iv = args.iv
-    payload_type = args.payload_type
+
+    payload_type = 0
 
     if args.model:
         payload_type = 3
         key = args.model
         iv = None
+    elif args.mac or args.longpass:
+        payload_type = 4
+        params = SimpleNamespace(
+            signature=args.signature,
+            serial=args.serial if (args.serial != "NONE") else "",
+            mac=args.mac if (args.mac != "NONE") else "",
+            longPass=args.longpass if (args.longpass != "NONE") else "",
+        )
+        print(
+            "Using TagParams inputs: "
+            f"serial='{params.serial}', mac='{params.mac}', longPass='{params.longPass}'"
+        )
+        if args.key_prefix:
+            params.key_prefix = args.key_prefix if (args.key_prefix != "NONE") else ""
+            print(f"Using key prefix: '{params.key_prefix}'")
+        if args.iv_prefix:
+            params.iv_prefix = args.iv_prefix if (args.iv_prefix != "NONE") else ""
+            print(f"Using iv prefix: '{params.iv_prefix}'")
+        key, iv = run_any_keygen(params, "tagparams")[:2]
     elif args.serial:
         payload_type = 4
         params = SimpleNamespace(signature=args.signature, serial=args.serial)
@@ -154,20 +211,31 @@ def main():
 
     signature = args.signature
     if not key and signature:
-        possible_key = zcu.known_keys.find_key(signature)
-        if possible_key is not None:
-            key = possible_key
-            payload_type = 2
-        if key:
-            print(f"Using key '{key}' for signature '{signature}'")
+        if not args.force_no_key:
+            possible_key = zcu.known_keys.find_key(signature)
+            if possible_key is not None:
+                key = possible_key
+                payload_type = 2
+            if key:
+                print(f"Using key '{key}' for signature '{signature}'")
+
+    incorrect_compressed_size = args.incorrect_compressed_size
+
+    data = zcu.compression.compress(
+        infile, args.chunk_size, incorrect_compressed_size=incorrect_compressed_size
+    )
+
+    if args.payload_type is not None:
+        if args.payload_type != payload_type:
+            print(f"Overriding Payload Type: {args.payload_type}")
+        payload_type = args.payload_type
 
     if all(b == 0 for b in signature) and payload_type in (2, 4):
         print("Warning: No/empty signature provided!")
 
     if all(b == 0 for b in key) and (payload_type != 0 or signature):
-        print("Warning: No key provided!")
-
-    data = zcu.compression.compress(infile, args.chunk_size)
+        if not args.force_no_key:
+            print("Warning: No key provided!")
 
     if payload_type == 2:
         encryptor = Xcryptor(
@@ -176,10 +244,11 @@ def main():
             include_unencrypted_length=args.include_unencrypted_length,
         )
         data = encryptor.encrypt(data)
-    elif payload_type in (3, 4):
+    elif payload_type in (3, 4, 5, 6):
         encryptor = CBCXcryptor(
             chunk_size=args.chunk_size,
             include_unencrypted_length=args.include_unencrypted_length,
+            payload_type=payload_type,
         )
         encryptor.set_key(aes_key=key, aes_iv=iv)
         data = encryptor.encrypt(data)
